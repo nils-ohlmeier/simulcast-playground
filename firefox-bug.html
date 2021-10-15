@@ -1,0 +1,135 @@
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+<script src="https://rawgit.com/otalk/sdp/master/sdp.js"></script>
+<script src="https://webrtc.github.io/samples/src/js/third_party/graph.js"></script>
+<script src="test-assert.js"></script>
+<script src="draw-graphs.js"></script>
+<style>
+video {
+  width: 320px;
+}
+</style>
+</head>
+<body>
+<div id="local">
+  <h2>Local Video</h2>
+</div>
+<div id="remotes">
+  <h2>Remote Videos</h2>
+</div>
+<script>
+const pc1 = new RTCPeerConnection();
+const pc2 = new RTCPeerConnection();
+pc1.onicecandidate = (e) => pc2.addIceCandidate(e.candidate);
+pc2.onicecandidate = (e) => pc1.addIceCandidate(e.candidate);
+pc2.ontrack = (e) => show(e.streams[0], true);
+
+const extensionsToFilter = [
+    'urn:ietf:params:rtp-hdrext:sdes:mid',
+    'urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id',
+    'urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id',
+];
+
+navigator.mediaDevices.getUserMedia({video: {wіdth: 1280, height: 720}})
+.then(stream => {
+    show(stream, false);
+    const sender = pc1.addTrack(stream.getTracks()[0], stream);
+    const bitrates = sessionStorage.bitrates ? JSON.parse(sessionStorage.bitrates) : [2500000, 500000, 150000];
+    sender.setParameters({encodings: [
+        {rid: "hi", maxBitrate: bitrates[0]},
+        {rid: "mid", maxBitrate: bitrates[1], scaleResolutionDownBy: 2},
+        {rid: "lo", maxBitrate: bitrates[2], scaleResolutionDownBy: 4},
+    ]});
+    return pc1.createOffer();
+})
+.then(offer => {
+    const sections = SDPUtils.splitSections(offer.sdp);
+    const dtls = SDPUtils.getDtlsParameters(sections[1], sections[0]);
+    const ice = SDPUtils.getIceParameters(sections[1], sections[0]);
+    const ssrcs = SDPUtils.matchPrefix(sections[1], 'a=ssrc:');
+    const midPrefix = adapter.browserDetails.version < 63 ? 'sdparta_' : '';
+    const rtpParameters = SDPUtils.parseRtpParameters(sections[1]);
+    const rtcpParameters = SDPUtils.parseRtcpParameters(sections[1]);
+    rtpParameters.headerExtensions = rtpParameters.headerExtensions.filter(ext => {
+        return !extensionsToFilter.includes(ext.uri);
+    });
+    let sdp = SDPUtils.writeSessionBoilerplate() +
+      SDPUtils.writeDtlsParameters(dtls, 'actpass') +
+      SDPUtils.writeIceParameters(ice) +
+      'a=group:BUNDLE ' + midPrefix + '0 ' + midPrefix + '1 ' + midPrefix + '2\r\n' +
+      'a=msid-semantic:WMS *\r\n';
+    const codecs = SDPUtils.writeRtpDescription('video', rtpParameters) +
+        SDPUtils.writeRtcpParameters({
+            mux:rtcpParameters.mux,
+            reducedSize: rtcpParameters.reducedSize,
+        });
+    sdp += codecs +
+        'a=mid:' + midPrefix + '0\r\n' +
+        'a=msid:low low\r\n' +
+        ssrcs[0] + '\r\n';
+    sdp += codecs +
+        'a=mid:' + midPrefix + '1\r\n' +
+        'a=msid:mid mid\r\n' +
+        ssrcs[1] + '\r\n';
+    sdp += codecs +
+        'a=mid:' + midPrefix + '2\r\n' +
+        'a=msid:hi hi\r\n' +
+        ssrcs[2] + '\r\n';
+    ssrc2track = ssrcs.map(line => (line.split(' ')[0].split(':')[1] >>> 0));
+    return Promise.all([
+        pc1.setLocalDescription(offer),
+        pc2.setRemoteDescription({type: 'offer', sdp})
+    ]);
+})
+.then(() => pc2.createAnswer())
+.then(answer => {
+    const sections = SDPUtils.splitSections(answer.sdp);
+    const dtls = SDPUtils.getDtlsParameters(sections[1], sections[0]);
+    const ice = SDPUtils.getIceParameters(sections[1], sections[0]);
+    const ssrcs = SDPUtils.matchPrefix(sections[1], 'a=ssrc:');
+
+    const localMid = SDPUtils.getMid(SDPUtils.splitSections(pc1.localDescription.sdp)[1]);
+    let sdp = SDPUtils.writeSessionBoilerplate() +
+      SDPUtils.writeDtlsParameters(dtls, 'active') +
+      SDPUtils.writeIceParameters(ice) +
+      'a=group:BUNDLE ' + localMid + '\r\n' +
+      'a=msid-semantic:WMS *\r\n';
+    const rtpParameters = SDPUtils.parseRtpParameters(sections[1]);
+    const rtcpParameters = SDPUtils.parseRtcpParameters(sections[1]);
+    const codecs = SDPUtils.writeRtpDescription('video', rtpParameters) +
+        SDPUtils.writeRtcpParameters({
+            mux:rtcpParameters.mux,
+            reducedSize: rtcpParameters.reducedSize,
+        });
+    sdp += codecs +
+        'a=mid:' + localMid + '\r\n';
+
+    sdp += 'a=rid:hi recv\r\n' +
+      'a=rid:mid recv\r\n' +
+      'a=rid:lo recv\r\n' +
+      'a=simulcast:recv hi;mid;lo\r\n';
+    const headerExtensions = SDPUtils.parseRtpParameters(SDPUtils.splitSections(pc1.localDescription.sdp)[1]).headerExtensions;
+    headerExtensions.forEach(ext => {
+        if (extensionsToFilter.includes(ext.uri)) {
+            sdp += 'a=extmap:' + ext.id + ' ' + ext.uri + '\r\n';
+        }
+    });
+    return Promise.all([
+        pc2.setLocalDescription(answer),
+        pc1.setRemoteDescription({type: 'answer', sdp})
+    ]);
+})
+.then(() => {
+    window.setInterval(() => {
+        draw(pc1, pc2);
+    }, 2000);
+    window.setTimeout(() => {
+        pc1.getSenders()[0].track.enabled = false;
+    }, 30000);
+})
+.catch(e => console.error(e));
+</script>
+</body>
+</html>
